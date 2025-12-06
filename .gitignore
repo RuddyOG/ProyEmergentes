@@ -1,0 +1,28 @@
+# entornos virtuales
+.venv/
+backend/venv/
+ENV/
+env/
+
+# cache/artefactos
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# salidas locales
+backend/out/
+backend/.streamlit/
+.streamlit/
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+
+# secretos locales
+.env
+*.env
+**/.env
+
+# NO ignorar la plantilla
+!.env.example
