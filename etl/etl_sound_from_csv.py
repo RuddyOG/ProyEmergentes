@@ -1,165 +1,161 @@
+# etl/etl_sound_from_csv.py
+
+import os
+import psycopg2
 import pandas as pd
-from pathlib import Path
-from etl.db import get_pg_connection
+from dotenv import load_dotenv
+import glob
 
-CSV_PATH = Path("data/raw/WS302-915M SONIDO NOV 2024.csv")
-SEP = ","
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(ENV_PATH)
+
+SOUND_CSV_PATH = os.path.join(
+    BASE_DIR,
+    "data",
+    "WS302-915M SONIDO NOV 2024.csv"  # file with spaces
+)
 
 
-def parse_lat_lon(location: str):
-    if not isinstance(location, str) or "," not in location:
-        return None, None
-    lat_str, lon_str = location.split(",", 1)
-    try:
-        return float(lat_str), float(lon_str)
-    except ValueError:
-        return None, None
+def get_pg_connection():
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=os.getenv("POSTGRES_PORT", "5432"),
+        dbname=os.getenv("POSTGRES_DB", "gamc_sensores"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "")
+    )
 
+import glob
+
+def load_csv():
+    # buscar cualquier archivo que contenga WS302 y SONIDO
+    pattern = os.path.join(BASE_DIR, "data", "*WS302*SONIDO*.csv")
+    files = glob.glob(pattern)
+
+    if not files:
+        raise FileNotFoundError("❌ No encontré ningún CSV que contenga WS302 y SONIDO en /data")
+
+    csv_path = files[0]
+    print(f"📥 Detectado archivo CSV de sonido: {csv_path}")
+
+    df = pd.read_csv(csv_path, encoding="latin-1", low_memory=False)
+
+    print(f"Filas cargadas crudas: {len(df)}")
+    return df
 
 def main():
-    if not CSV_PATH.exists():
-        raise FileNotFoundError(f"No se encuentra el CSV: {CSV_PATH}")
+    df = load_csv()
 
-    print(f"Leyendo CSV de sonido: {CSV_PATH}")
-    df = pd.read_csv(CSV_PATH, sep=SEP, low_memory=False)
+    # Nos quedamos solo con las columnas que nos interesan
+    needed_cols = [
+        "time",
+        "deviceInfo.devEui",
+        "devAddr",
+        "fCnt",
+        "dr",
+        "object.LAeq",
+        "object.LAI",
+        "object.LAImax",
+        "object.battery",
+        "object.status",
+    ]
 
-    def col(name1, name2=None):
-        if name1 in df.columns:
-            return df[name1]
-        if name2 and name2 in df.columns:
-            return df[name2]
-        return None
+    for col in needed_cols:
+        if col not in df.columns:
+            raise ValueError(f"❌ Falta la columna '{col}' en el CSV. Revisa el encabezado.")
 
-    dev_eui = col("deviceInfo.devEui", "deviceinfo.devEui")
-    device_name = col("deviceInfo.deviceName", "deviceinfo.deviceName")
-    tenant_name = col("deviceInfo.tenantName", "deviceinfo.tenantName")
-    application_name = col("deviceInfo.applicatioName", "deviceinfo.applicatioName")
-    description = col("deviceInfo.tag.description", "deviceinfo.tag.description")
-    address = col("deviceInfo.tag.Address", "deviceInfo.tag.address")
-    location_raw = col("deviceInfo.tag.location", "deviceinfo.tag.location")
-    dev_addr = col("devAddr", "DevAddr")
-    fcnt = col("fcnt", "fCnt")
-    dr = col("dr", "DR")
-    time_raw = col("Time", "time")
+    df = df[needed_cols].copy()
 
-    laeq = col("object.laeq")
-    lai = col("object.lai")
-    lai_max = col("object.laiMax")
-    battery = col("object.battery")
-    status = col("object.status")
+    # Filtramos filas con LAeq válido
+    df = df[df["object.LAeq"].notnull()]
+    print(f"Filas con LAeq válido: {len(df)}")
 
+    if df.empty:
+        print("❌ No hay filas con LAeq. Revisa que el CSV tenga datos en object.LAeq.")
+        return
+
+    # Parsear tiempo (viene en UTC con +00:00) y convertir a hora local
+    df["measured_at_utc"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    df = df[df["measured_at_utc"].notnull()]
+    print(f"Filas con timestamp válido: {len(df)}")
+
+    # Ajustamos a zona horaria de Cochabamba (UTC-4)
+    df["measured_at"] = df["measured_at_utc"].dt.tz_convert("America/La_Paz")
+    df["hour_of_day"] = df["measured_at"].dt.hour
+    df["dayofweek"] = df["measured_at"].dt.dayofweek  # 0=lunes
+
+    # Conexión a Postgres
     conn = get_pg_connection()
     cur = conn.cursor()
 
-    total = len(df)
+    # Mapeo dev_eui -> sensor_id
+    cur.execute("""
+        SELECT sensor_id, dev_eui
+        FROM sensors
+        WHERE type = 'SONIDO';
+    """)
+    rows = cur.fetchall()
+    dev_eui_to_id = {dev_eui: sensor_id for (sensor_id, dev_eui) in rows}
+    print(f"Sensores de sonido en tabla sensors: {len(dev_eui_to_id)}")
+
+    # Opcional: limpiar tabla antes de cargar (porque ahora sí cargamos datos reales)
+    print("🧹 Limpiando tabla sound_measurements...")
+    cur.execute("TRUNCATE TABLE sound_measurements RESTART IDENTITY;")
+    conn.commit()
+
+    insert_sql = """
+        INSERT INTO sound_measurements (
+            sensor_id,
+            measured_at,
+            laeq_db,
+            lai_db,
+            lai_max_db,
+            battery_pct,
+            status,
+            dev_addr,
+            fcnt,
+            dr
+        )
+        VALUES (%(sensor_id)s, %(measured_at)s, %(laeq_db)s, %(lai_db)s, %(lai_max_db)s,
+                %(battery_pct)s, %(status)s, %(dev_addr)s, %(fcnt)s, %(dr)s)
+    """
+
     inserted = 0
+    skipped_no_sensor = 0
 
-    for i in range(total):
-        try:
-            row_dev_eui = str(dev_eui.iloc[i]) if dev_eui is not None else None
-            if not row_dev_eui or row_dev_eui == "nan":
-                continue
+    for _, row in df.iterrows():
+        dev_eui = row["deviceInfo.devEui"]
 
-            row_device_name = str(device_name.iloc[i]) if device_name is not None else None
-            row_tenant_name = str(tenant_name.iloc[i]) if tenant_name is not None else None
-            row_app_name = str(application_name.iloc[i]) if application_name is not None else None
-            row_desc = str(description.iloc[i]) if description is not None else None
-            row_address = str(address.iloc[i]) if address is not None else None
-            row_loc = str(location_raw.iloc[i]) if location_raw is not None else None
-            lat, lon = parse_lat_lon(row_loc)
+        sensor_id = dev_eui_to_id.get(dev_eui)
+        if sensor_id is None:
+            skipped_no_sensor += 1
+            continue
 
-            row_time = time_raw.iloc[i] if time_raw is not None else None
-            if pd.isna(row_time):
-                continue
-            try:
-                measured_at = pd.to_datetime(row_time, utc=True)
-            except Exception:
-                continue
+        measured_at = row["measured_at"].to_pydatetime()  # tz-aware, Postgres timestamptz lo acepta
 
-            row_dev_addr = str(dev_addr.iloc[i]) if dev_addr is not None else None
-            row_fcnt = int(fcnt.iloc[i]) if fcnt is not None and not pd.isna(fcnt.iloc[i]) else None
-            row_dr = str(dr.iloc[i]) if dr is not None else None
+        payload = {
+            "sensor_id": sensor_id,
+            "measured_at": measured_at,
+            "laeq_db": float(row["object.LAeq"]) if pd.notnull(row["object.LAeq"]) else None,
+            "lai_db": float(row["object.LAI"]) if pd.notnull(row["object.LAI"]) else None,
+            "lai_max_db": float(row["object.LAImax"]) if pd.notnull(row["object.LAImax"]) else None,
+            "battery_pct": float(row["object.battery"]) if pd.notnull(row["object.battery"]) else None,
+            "status": str(row["object.status"]) if pd.notnull(row["object.status"]) else None,
+            "dev_addr": str(row["devAddr"]) if pd.notnull(row["devAddr"]) else None,
+            "fcnt": int(row["fCnt"]) if pd.notnull(row["fCnt"]) else None,
+            "dr": str(row["dr"]) if pd.notnull(row["dr"]) else None,
+        }
 
-            row_laeq = float(laeq.iloc[i]) if laeq is not None and not pd.isna(laeq.iloc[i]) else None
-            row_lai = float(lai.iloc[i]) if lai is not None and not pd.isna(lai.iloc[i]) else None
-            row_lai_max = float(lai_max.iloc[i]) if lai_max is not None and not pd.isna(lai_max.iloc[i]) else None
-            row_battery = float(battery.iloc[i]) if battery is not None and not pd.isna(battery.iloc[i]) else None
-            row_status = str(status.iloc[i]) if status is not None and not pd.isna(status.iloc[i]) else None
-
-            # Upsert sensor
-            cur.execute(
-                """
-                INSERT INTO sensors (
-                    dev_eui, type, name, description, address,
-                    latitude, longitude, tenant_name, application_name
-                ) VALUES (
-                    %(dev_eui)s, 'SONIDO', %(name)s, %(description)s, %(address)s,
-                    %(lat)s, %(lon)s, %(tenant)s, %(app)s
-                )
-                ON CONFLICT (dev_eui) DO UPDATE
-                   SET name = EXCLUDED.name,
-                       description = EXCLUDED.description,
-                       address = EXCLUDED.address,
-                       latitude = EXCLUDED.latitude,
-                       longitude = EXCLUDED.longitude,
-                       tenant_name = EXCLUDED.tenant_name,
-                       application_name = EXCLUDED.application_name
-                RETURNING sensor_id;
-                """,
-                {
-                    "dev_eui": row_dev_eui,
-                    "name": row_device_name,
-                    "description": row_desc,
-                    "address": row_address,
-                    "lat": lat,
-                    "lon": lon,
-                    "tenant": row_tenant_name,
-                    "app": row_app_name,
-                },
-            )
-            sensor_id = cur.fetchone()[0]
-
-            # Insert medición
-            cur.execute(
-                """
-                INSERT INTO sound_measurements (
-                    sensor_id, measured_at,
-                    laeq_db, lai_db, lai_max_db,
-                    battery_pct, status, dev_addr, fcnt, dr
-                ) VALUES (
-                    %(sensor_id)s, %(measured_at)s,
-                    %(laeq)s, %(lai)s, %(lai_max)s,
-                    %(battery)s, %(status)s, %(dev_addr)s, %(fcnt)s, %(dr)s
-                );
-                """,
-                {
-                    "sensor_id": sensor_id,
-                    "measured_at": measured_at,
-                    "laeq": row_laeq,
-                    "lai": row_lai,
-                    "lai_max": row_lai_max,
-                    "battery": row_battery,
-                    "status": row_status,
-                    "dev_addr": row_dev_addr,
-                    "fcnt": row_fcnt,
-                    "dr": row_dr,
-                },
-            )
-
-            inserted += 1
-            if inserted % 100 == 0:
-                conn.commit()
-                print(f"{inserted} filas insertadas...")
-
-        except Exception as e:
-            conn.rollback()
-            print(f"Error en fila {i}: {e}")
+        cur.execute(insert_sql, payload)
+        inserted += 1
 
     conn.commit()
     cur.close()
     conn.close()
-    print(f"ETL sonido terminado. Filas insertadas: {inserted} de {total}")
 
+    print(f"✅ Filas insertadas en sound_measurements: {inserted}")
+    print(f"⚠️ Filas saltadas por no encontrar sensor en 'sensors' (dev_eui): {skipped_no_sensor}")
 
 if __name__ == "__main__":
     main()

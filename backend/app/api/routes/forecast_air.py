@@ -1,0 +1,3 @@
+@router.get("/air/forecast")
+def forecast_air(sensor_id: str, horizon_days: int = 7):
+    ...
